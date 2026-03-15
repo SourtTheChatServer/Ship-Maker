@@ -4,137 +4,210 @@ import logging
 import threading
 import gc
 import sys
-from flask import Flask
+import traceback
+from datetime import datetime
+from collections import deque
+from flask import Flask, Response, request, redirect, url_for
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 
-# --- CONFIG ---
+# --- CONFIGURATION ---
 TARGET_URL = 'https://drednot.io/'
-# Use Environment Variable 'BOT_KEY' on Render for security
-ANONYMOUS_LOGIN_KEY = os.getenv('BOT_KEY', '_M85tFxFxIRDax_nh-HYm1gT')
+ANONYMOUS_LOGIN_KEY = os.environ.get("ANONYMOUS_LOGIN_KEY", "_M85tFxFxIRDax_nh-HYm1gT")
 
-logging.basicConfig(
-    level=logging.INFO, format='[%(asctime)s] %(message)s', datefmt='%H:%M:%S'
-)
+# RESTART LIMITS (To prevent RAM leaks on Render)
+MAX_CYCLES_PER_SESSION = 20  
+MAX_MINUTES_PER_SESSION = 30
 
+# --- GLOBAL STATE ---
+BOT_STATE = {
+    "status": "Initializing...",
+    "start_time": datetime.now(),
+    "cycles_completed": 0,
+    "last_event": "None yet.",
+    "event_log": deque(maxlen=15)
+}
+
+def log_event(message):
+    timestamp = datetime.now().strftime('%H:%M:%S')
+    full_message = f"[{timestamp}] {message}"
+    BOT_STATE["event_log"].appendleft(full_message)
+    BOT_STATE["last_event"] = message
+    logging.info(message)
+
+# --- BROWSER SETUP (DOCKER OPTIMIZED) ---
 def setup_driver():
+    logging.info("🚀 Launching Headless Chromium (Docker Mode)")
     opts = Options()
-    opts.binary_location = "/usr/bin/chromium" 
+    opts.binary_location = "/usr/bin/chromium"
     opts.add_argument("--headless=new")
     opts.add_argument("--no-sandbox")
-    opts.add_argument("--disable-gpu")
     opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--disable-gpu")
     opts.add_argument("--window-size=1280,720")
-    # Optimize for Render's tiny RAM
+    
+    # RAM Optimizations
     opts.add_argument("--js-flags=--max-old-space-size=128")
     opts.add_experimental_option("prefs", {"profile.managed_default_content_settings.images": 2})
-    
-    return webdriver.Chrome(service=Service("/usr/bin/chromedriver"), options=opts)
 
-def start_bot():
+    service = Service(executable_path="/usr/bin/chromedriver")
+    return webdriver.Chrome(service=service, options=opts)
+
+# --- THE CORE BOT LOGIC ---
+def start_bot_cycle():
+    global driver
     driver = setup_driver()
+    wait = WebDriverWait(driver, 30)
+    
+    cycles_in_this_session = 0
+    start_time = time.time()
+
     try:
-        logging.info(f"📍 Loading {TARGET_URL}")
+        log_event(f"📍 Loading {TARGET_URL}")
         driver.get(TARGET_URL)
-        
-        # Give Render a lot of time to load the WASM engine
-        logging.info("⏳ Waiting 30s for game engine...")
-        time.sleep(30)
+        time.sleep(15)
 
-        # CHECK IF PAGE LOADED
-        res = driver.execute_script("return {buttons: document.querySelectorAll('button').length, canvas: !!document.querySelector('canvas')}")
-        logging.info(f"🔍 Page Check: {res['buttons']} buttons found, Canvas exists: {res['canvas']}")
-
-        # MASTER SCRIPT: Handles Accept -> Restore -> Login -> Your Cycle
-        master_script = f"""
-        (async function() {{
-            const sleep = ms => new Promise(r => setTimeout(r, ms));
-            const findAndClick = (txt, tag = '*') => {{
-                const el = [...document.querySelectorAll(tag)].find(e => e.textContent.includes(txt));
-                if (el) {{ el.click(); return true; }}
-                return false;
-            }};
-
-            console.log("Master Script Started");
-
-            while (true) {{
-                // 1. Handle Notice/Accept
-                if (findAndClick("Accept", "button")) {{
-                    console.log("Clicked Accept");
-                    await sleep(2000);
-                }}
-
-                // 2. Handle Login if menu isn't visible
-                const menuVisible = [...document.querySelectorAll('button')].some(b => b.textContent.includes('New Ship'));
-                
-                if (!menuVisible) {{
-                    if (findAndClick("Restore", "a")) {{
-                        console.log("Clicked Restore");
-                        await sleep(2000);
-                        const input = document.querySelector('.modal-window input');
-                        if (input) {{
-                            input.value = "{ANONYMOUS_LOGIN_KEY}";
-                            input.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                            await sleep(500);
-                            findAndClick("Submit", "button");
-                            console.log("Submitted Key");
-                            await sleep(3000);
-                        }}
-                    }}
-                    if (findAndClick("Play Anonymously", "button")) {{
-                        console.log("Clicked Play");
-                        await sleep(5000);
-                    }}
-                }}
-
-                // 3. YOUR ORIGINAL SHIP CYCLE CODE
-                if (menuVisible) {{
-                    console.log("Menu active. Starting ship cycle.");
-                    findAndClick("New Ship", "button");
-                    await sleep(2000);
-                    findAndClick("Launch", "button");
-                    console.log("Launched Ship");
-                    
-                    await sleep(15000); // Stay in game
-
-                    const exitBtn = document.querySelector("#exit_button") || 
-                                    [...document.querySelectorAll('button')].find(b => b.textContent.includes('Exit'));
-                    if (exitBtn) exitBtn.click();
-                    console.log("Exited Ship");
-                    await sleep(5000);
-                }}
-
-                await sleep(5000); // Loop delay
-            }}
-        }})();
-        """
-
-        logging.info("💉 Injecting Master Control Script...")
-        driver.execute_script(master_script)
-
-        # Keep Python alive while the JS runs in the browser
         while True:
-            # Check every 60s if the browser is still responsive
-            driver.title
-            time.sleep(60)
+            # Check for Session Expiry
+            elapsed_mins = (time.time() - start_time) / 60
+            if cycles_in_this_session >= MAX_CYCLES_PER_SESSION or elapsed_mins >= MAX_MINUTES_PER_SESSION:
+                log_event("♻️ Session limit reached. Performing clean restart...")
+                break
 
-    except Exception as e:
-        logging.error(f"🔥 Driver Crash: {e}")
+            gc.collect()
+
+            # --- 1. HANDLE "ACCEPT" NOTICE ---
+            try:
+                accept_btns = driver.find_elements(By.XPATH, "//button[contains(text(), 'Accept')]")
+                if accept_btns:
+                    log_event("✅ Notice found. Clicking Accept...")
+                    driver.execute_script("arguments[0].click();", accept_btns[0])
+                    time.sleep(3)
+            except: pass
+
+            # --- 2. HANDLE LOGIN / RESTORE ---
+            try:
+                # Check if menu is missing
+                if not driver.find_elements(By.XPATH, "//button[contains(.,'New Ship')]"):
+                    log_event("🔑 Menu not found. Checking for Restore...")
+                    
+                    restore_links = driver.find_elements(By.XPATH, "//a[contains(text(),'Restore')]")
+                    if restore_links:
+                        driver.execute_script("arguments[0].click();", restore_links[0])
+                        time.sleep(2)
+
+                        # Enter Key
+                        key_input = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, ".modal-window input")))
+                        key_input.send_keys(ANONYMOUS_LOGIN_KEY)
+                        
+                        # Trigger input event to enable the 'Submit' button
+                        driver.execute_script("arguments[0].dispatchEvent(new Event('input', { bubbles: true }));", key_input)
+                        time.sleep(1)
+
+                        submit_btn = driver.find_element(By.XPATH, "//button[text()='Submit']")
+                        driver.execute_script("arguments[0].click();", submit_btn)
+                        log_event("🔑 Key submitted.")
+                        time.sleep(4)
+
+                    # Click Play Anonymously
+                    play_btns = driver.find_elements(By.XPATH, "//button[contains(text(),'Play Anonymously')]")
+                    if play_btns:
+                        driver.execute_script("arguments[0].click();", play_btns[0])
+                        log_event("🔑 Clicking Play Anonymously...")
+                        time.sleep(6)
+            except Exception as e:
+                log_event(f"⚠️ Login phase error: {str(e)[:50]}")
+
+            # --- 3. SHIP CREATION CYCLE ---
+            try:
+                driver.implicitly_wait(5)
+                menu_btn = driver.find_elements(By.XPATH, "//button[contains(.,'New Ship')]")
+                
+                if menu_btn:
+                    BOT_STATE["status"] = "Creating Ship..."
+                    log_event("🚢 Creating New Ship...")
+                    driver.execute_script("arguments[0].click();", menu_btn[0])
+                    time.sleep(2)
+
+                    launch_btn = wait.until(EC.element_to_be_clickable((By.XPATH, "//button[contains(.,'Launch')]")))
+                    driver.execute_script("arguments[0].click();", launch_btn)
+                    
+                    log_event("🚀 Ship Launched! Holding 15s...")
+                    BOT_STATE["status"] = "In Game"
+                    time.sleep(15)
+
+                    log_event("🚪 Exiting Ship...")
+                    driver.execute_script("""
+                        const exit = document.querySelector('#exit_button') || 
+                                     [...document.querySelectorAll('button')].find(b => b.textContent.includes('Exit'));
+                        if (exit) exit.click();
+                    """)
+                    
+                    # Wait for return to menu
+                    wait.until(EC.presence_of_element_located((By.XPATH, "//button[contains(.,'New Ship')]")))
+                    
+                    cycles_in_this_session += 1
+                    BOT_STATE["cycles_completed"] += 1
+                    log_event(f"✨ Cycle {BOT_STATE['cycles_completed']} Done.")
+                    time.sleep(5)
+                else:
+                    log_event("⏳ Waiting for main menu...")
+                    time.sleep(5)
+
+            except Exception as e:
+                log_event(f"❌ Cycle error: {str(e)[:50]}")
+                driver.refresh()
+                time.sleep(10)
+
+    except Exception:
+        log_event(f"🔥 Driver Crash: {traceback.format_exc()[:100]}")
     finally:
-        logging.info("🧹 Cleaning up browser...")
+        log_event("🧹 Shutting down browser...")
         driver.quit()
 
-# --- FLASK ---
-app = Flask(__name__)
-@app.route("/")
-def health(): return "Bot Running", 200
+# --- FLASK DASHBOARD ---
+flask_app = Flask('')
+@flask_app.route('/')
+def health_check():
+    html = f"""
+    <!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta http-equiv="refresh" content="10">
+    <title>Drednot Cycle Bot</title><style>
+        body {{ font-family: sans-serif; background: #121212; color: #eee; padding: 20px; }}
+        .card {{ background: #1e1e1e; padding: 20px; border-radius: 8px; border: 1px solid #333; }}
+        .stat {{ margin-bottom: 10px; font-size: 1.1em; }}
+        .label {{ color: #4ec9b0; font-weight: bold; }}
+        .log-box {{ background: #000; padding: 10px; border-radius: 4px; height: 300px; overflow-y: auto; font-family: monospace; font-size: 0.9em; }}
+    </style></head>
+    <body><div class="card">
+        <h1>Drednot Bot Dashboard</h1>
+        <div class="stat"><span class="label">Status:</span> {BOT_STATE['status']}</div>
+        <div class="stat"><span class="label">Total Cycles:</span> {BOT_STATE['cycles_completed']}</div>
+        <div class="stat"><span class="label">Last Event:</span> {BOT_STATE['last_event']}</div>
+        <hr>
+        <h3>Event Log</h3>
+        <div class="log-box">{'<br>'.join(BOT_STATE['event_log'])}</div>
+    </div></body></html>
+    """
+    return Response(html, mimetype='text/html')
 
-if __name__ == "__main__":
+def run_flask():
     port = int(os.environ.get("PORT", 10000))
-    threading.Thread(target=lambda: app.run(host="0.0.0.0", port=port, use_reloader=False), daemon=True).start()
+    flask_app.run(host='0.0.0.0', port=port)
+
+# --- MAIN EXECUTION ---
+if __name__ == "__main__":
+    # Start Dashboard
+    threading.Thread(target=run_flask, daemon=True).start()
+
     while True:
         try:
-            start_bot()
-        except:
-            time.sleep(10)
+            BOT_STATE["status"] = "Starting session..."
+            start_bot_cycle()
+            time.sleep(10) # Cooldown before next session
+        except Exception as e:
+            log_event(f"SYSTEM: Restarting in 30s... Error: {e}")
+            time.sleep(30)
