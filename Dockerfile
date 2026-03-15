@@ -1,11 +1,13 @@
 FROM python:3.11-slim
 
-# Install Chromium, Driver, and Mesa (Required for Software WebGL)
+# Install Chromium, Driver, and modern Mesa libraries for Software WebGL
 RUN apt-get update && apt-get install -y \
     chromium \
     chromium-driver \
+    libgl1 \
+    libegl1 \
+    libgbm1 \
     libgl1-mesa-dri \
-    libgl1-mesa-glx \
     libosmesa6 \
     && rm -rf /var/lib/apt/lists/*
 
